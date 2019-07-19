@@ -6,12 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"statusok/database"
+	"statusok/notify"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"time"
+	"strings"
+	"github.com/tidwall/gjson"
 )
 
 var (
@@ -40,7 +43,18 @@ type RequestConfig struct {
 	UrlParams    map[string]string `json:"urlParams"`
 	ResponseCode int               `json:"responseCode"`
 	ResponseTime int64             `json:"responseTime"`
+	ResponseBody []ResponseConfig  `json:"responseBody"`
 	CheckEvery   time.Duration     `json:"checkEvery"`
+}
+
+type ResponseConfig struct {
+	ResponseValue         string
+	Valid                 bool
+	Key                   string      `json:key`
+	Empty                 bool        `json:isEmpty`
+	CharCountGreaterThan  int64       `json:charCountGreaterThan`
+	Int                   bool        `json:isInt`
+	ErrorMessage          []string
 }
 
 //Set Id for request
@@ -260,6 +274,8 @@ func PerformRequest(requestConfig RequestConfig, throttle chan int) error {
 
 	getResponse, respErr := client.Do(request)
 
+	respBody := convertResponseToString(getResponse)
+
 	if respErr != nil {
 		//Request failed . Add error info to database
 		var statusCode int
@@ -273,7 +289,7 @@ func PerformRequest(requestConfig RequestConfig, throttle chan int) error {
 			Url:          requestConfig.Url,
 			RequestType:  requestConfig.RequestType,
 			ResponseCode: statusCode,
-			ResponseBody: convertResponseToString(getResponse),
+			ResponseBody: respBody,
 			Reason:       database.ErrDoRequest,
 			OtherInfo:    respErr.Error(),
 		})
@@ -289,11 +305,30 @@ func PerformRequest(requestConfig RequestConfig, throttle chan int) error {
 			Url:          requestConfig.Url,
 			RequestType:  requestConfig.RequestType,
 			ResponseCode: getResponse.StatusCode,
-			ResponseBody: convertResponseToString(getResponse),
+			ResponseBody: respBody,
 			Reason:       errResposeCode(getResponse.StatusCode, requestConfig.ResponseCode),
 			OtherInfo:    "",
 		})
 		return errResposeCode(getResponse.StatusCode, requestConfig.ResponseCode)
+	}
+
+	//Validate Response Body
+	for body := range requestConfig.ResponseBody {
+		respErr := ValidateResponse(respBody, requestConfig.ResponseBody[body])
+		fmt.Println("Errors found")
+		fmt.Println(respErr.ErrorMessage)
+		if len(respErr.ErrorMessage) != 0 {
+			var respMessage strings.Builder
+			for i := range respErr.ErrorMessage {
+				respMessage.WriteString("\n")
+				respMessage.WriteString(respErr.ErrorMessage[i])
+			}
+			notify.SendErrorNotification(notify.ErrorNotification{requestConfig.Url,
+				requestConfig.RequestType,
+				respBody,
+				"Response Body Validation",
+				respMessage.String()})
+		}
 	}
 
 	elapsed := time.Since(start)
@@ -365,4 +400,43 @@ func GetJsonParamsBody(params map[string]string) (io.Reader, error) {
 //creates an error when response code from server is not equal to response code mentioned in config file
 func errResposeCode(status int, expectedStatus int) error {
 	return errors.New(fmt.Sprintf("Got Response code %v. Expected Response Code %v ", status, expectedStatus))
+}
+
+func ValidateResponse(respBody string, responseConfig ResponseConfig) ResponseConfig {
+
+	resp := gjson.Get(respBody, responseConfig.Key).String()
+	responseConfig.ResponseValue = resp
+
+	//Default Valid status to true
+	responseConfig.Valid = true
+
+	var errMessage []string
+
+	//Validate whether the response is empty
+	if responseConfig.Empty == true && resp != "" {
+		responseConfig.Valid = false
+		errMessage = append(errMessage, "Response is not empty")
+	} else if responseConfig.Empty == false && resp == "" {
+		responseConfig.Valid = false
+		errMessage = append(errMessage, "Response is empty")
+	}
+
+	//Validate character count greater than
+	if responseConfig.CharCountGreaterThan != 0 && int64(len(resp)) > responseConfig.CharCountGreaterThan {
+		responseConfig.Valid = false
+		errMessage = append(errMessage, "Character count is too small")
+	}
+
+	fmt.Println(responseConfig)
+	if _, err := strconv.Atoi(resp); err != nil && responseConfig.Int == true {
+		responseConfig.Valid = false
+		errMessage = append(errMessage, "Response Value is not Integer")
+	} else if _, err := strconv.Atoi(resp); err == nil && responseConfig.Int == false {
+		responseConfig.Valid = false
+		errMessage = append(errMessage, "Response Value is an Integer")
+	}
+	responseConfig.ErrorMessage = errMessage
+
+	return responseConfig
+
 }
